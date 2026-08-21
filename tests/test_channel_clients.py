@@ -200,11 +200,15 @@ def _import_telegram_channel(monkeypatch: pytest.MonkeyPatch):
     telegram_constants = types.ModuleType("telegram.constants")
     telegram_error = types.ModuleType("telegram.error")
     telegram_ext = types.ModuleType("telegram.ext")
+    telegram_request = types.ModuleType("telegram.request")
 
     class Update:
         ALL_TYPES = ["message"]
 
     class Bot:
+        async def get_updates(self, *args, **kwargs):
+            return []
+
         async def edit_message_text(self, *args, **kwargs):
             return True
 
@@ -279,6 +283,9 @@ def _import_telegram_channel(monkeypatch: pytest.MonkeyPatch):
             self._token = token
             return self
 
+        def get_updates_request(self, _request):
+            return self
+
         def build(self):
             return _Application(self._token)
 
@@ -286,6 +293,7 @@ def _import_telegram_channel(monkeypatch: pytest.MonkeyPatch):
         def __init__(self, token):
             self.token = token
             self.bot = SimpleNamespace(
+                get_updates=AsyncMock(return_value=[]),
                 send_message=AsyncMock(return_value=SimpleNamespace(message_id=99)),
                 edit_message_text=AsyncMock(),
                 send_document=AsyncMock(),
@@ -338,10 +346,29 @@ def _import_telegram_channel(monkeypatch: pytest.MonkeyPatch):
         PHOTO=_Filter(),
         Document=_Document(),
     )
+    class BaseRequest:
+        pass
+
+    class HTTPXRequest(BaseRequest):
+        def __init__(self):
+            self.read_timeout = 5.0
+
+        async def initialize(self):
+            return None
+
+        async def shutdown(self):
+            return None
+
+        async def do_request(self, **_kwargs):
+            return 200, b"{}"
+
+    telegram_request.BaseRequest = BaseRequest
+    telegram_request.HTTPXRequest = HTTPXRequest
     monkeypatch.setitem(sys.modules, "telegram", telegram)
     monkeypatch.setitem(sys.modules, "telegram.constants", telegram_constants)
     monkeypatch.setitem(sys.modules, "telegram.error", telegram_error)
     monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
+    monkeypatch.setitem(sys.modules, "telegram.request", telegram_request)
     sys.modules.pop("infra.channels.telegram_channel", None)
     return importlib.import_module("infra.channels.telegram_channel")
 
@@ -967,6 +994,7 @@ async def test_telegram_non_conflict_error_semantics_unchanged(
     bus = _Bus()
     session_manager = _SessionManager(tmp_path)
     channel = mod.TelegramChannel("token", bus, session_manager)
+    channel._last_poll_activity_at = 0
 
     with caplog.at_level(logging.WARNING, logger="infra.channels.telegram_channel"):
         channel._on_polling_error(mod.NetworkError("network down"))
@@ -974,6 +1002,7 @@ async def test_telegram_non_conflict_error_semantics_unchanged(
 
     assert channel._conflict_count == 0  # 非 Conflict 不计入冲突
     assert channel._last_conflict_log_at is None  # 节流状态不变
+    assert channel._last_poll_activity_at > 0
     assert "polling 异常，框架将自动重试" in caplog.text
 
 
@@ -1004,6 +1033,294 @@ async def test_telegram_conflict_log_throttled(
 
     assert channel._conflict_count == 4
     assert len([r for r in caplog.records if "409 Conflict" in r.getMessage()]) == 1
+
+
+@pytest.mark.asyncio
+async def test_telegram_start_and_stop_own_polling_health_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("token", _Bus(), _SessionManager(tmp_path))
+
+    await channel.start()
+
+    assert channel._polling_watch_task is not None
+    assert channel._polling_watch_task.get_name() == mod._POLLING_WATCH_TASK_NAME
+    assert channel._connectivity_probe_task is not None
+    assert channel._connectivity_probe_task.get_name() == mod._PROBE_TASK_NAME
+
+    await channel.stop()
+
+    assert channel._polling_watch_task is None
+    assert channel._connectivity_probe_task is None
+    assert channel._shutting_down is True
+
+
+@pytest.mark.asyncio
+async def test_telegram_connectivity_probe_uses_environment_without_token_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("secret-token", _Bus(), _SessionManager(tmp_path))
+    captured: dict[str, object] = {}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url: str):
+            captured["url"] = url
+            return SimpleNamespace(status_code=302)
+
+    def _client_factory(**kwargs):
+        captured["kwargs"] = kwargs
+        return _Client()
+
+    monkeypatch.setattr(mod.httpx, "AsyncClient", _client_factory)
+
+    result = await channel._probe_telegram_connectivity()
+
+    assert result.ok is True
+    assert result.detail == "HTTP 302"
+    assert captured["url"] == "https://api.telegram.org"
+    assert "secret-token" not in str(captured["url"])
+    assert captured["kwargs"] == {
+        "timeout": mod._PROBE_TIMEOUT_SECONDS,
+        "trust_env": True,
+        "follow_redirects": False,
+    }
+
+    class _FailingClient:
+        async def __aenter__(self):
+            request = httpx.Request(
+                "GET",
+                "https://api.telegram.org/botsecret-token/getMe",
+            )
+            raise httpx.ConnectError("secret-token", request=request)
+
+        async def __aexit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(mod.httpx, "AsyncClient", lambda **_kwargs: _FailingClient())
+
+    failed = await channel._probe_telegram_connectivity()
+
+    assert failed == mod._ConnectivityProbeResult(False, "ConnectError")
+    assert "secret-token" not in failed.detail
+
+
+@pytest.mark.asyncio
+async def test_telegram_probe_recovery_restarts_only_after_threshold_and_stall(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("token", _Bus(), _SessionManager(tmp_path))
+    updater = channel._app.updater
+    updater.running = True
+    setattr(
+        updater,
+        "_Updater__polling_task",
+        SimpleNamespace(done=lambda: False),
+    )
+    channel._last_poll_activity_at = (
+        mod.time.monotonic() - mod._STALL_THRESHOLD_SECONDS - 1
+    )
+    restart = AsyncMock(return_value=True)
+    monkeypatch.setattr(channel, "_restart_polling", restart)
+    failed = mod._ConnectivityProbeResult(False, "ConnectTimeout")
+
+    for _ in range(mod._PROBE_FAIL_THRESHOLD - 1):
+        assert await channel._apply_connectivity_probe_result(updater, failed) is False
+        assert channel._probe_network_unavailable is False
+
+    with caplog.at_level(logging.WARNING, logger="infra.channels.telegram_channel"):
+        assert await channel._apply_connectivity_probe_result(updater, failed) is False
+        assert channel._probe_network_unavailable is True
+        assert await channel._apply_connectivity_probe_result(
+            updater,
+            mod._ConnectivityProbeResult(True, "HTTP 302"),
+        ) is True
+
+    restart.assert_awaited_once_with(
+        updater,
+        expected_task=getattr(updater, "_Updater__polling_task"),
+    )
+    assert channel._probe_consecutive_fail == 0
+    assert channel._probe_network_unavailable is False
+    assert channel._last_probe_ok is True
+    assert "判定假死" in caplog.text
+    assert "外部探活恢复，重启 polling" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("polling_done", [False, True])
+async def test_telegram_probe_recovery_skips_healthy_or_exited_polling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    polling_done: bool,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("token", _Bus(), _SessionManager(tmp_path))
+    updater = channel._app.updater
+    updater.running = True
+    setattr(
+        updater,
+        "_Updater__polling_task",
+        SimpleNamespace(done=lambda: polling_done),
+    )
+    channel._last_poll_activity_at = mod.time.monotonic()
+    channel._probe_network_unavailable = True
+    channel._probe_consecutive_fail = mod._PROBE_FAIL_THRESHOLD
+    restart = AsyncMock(return_value=True)
+    monkeypatch.setattr(channel, "_restart_polling", restart)
+
+    restarted = await channel._apply_connectivity_probe_result(
+        updater,
+        mod._ConnectivityProbeResult(True, "HTTP 302"),
+    )
+
+    assert restarted is False
+    restart.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_telegram_polling_watchdog_restarts_exited_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("token", _Bus(), _SessionManager(tmp_path))
+    updater = channel._app.updater
+    updater.running = True
+    setattr(
+        updater,
+        "_Updater__polling_task",
+        SimpleNamespace(
+            done=lambda: True,
+            exception=lambda: RuntimeError("polling crashed"),
+        ),
+    )
+    sleeps = 0
+
+    async def _sleep(_delay: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 3:
+            channel._shutting_down = True
+
+    restart = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(channel, "_restart_polling", restart)
+
+    await channel._watch_polling_loop()
+
+    restart.assert_awaited_once_with(
+        updater,
+        expected_task=getattr(updater, "_Updater__polling_task"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_telegram_restart_polling_never_crosses_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("token", _Bus(), _SessionManager(tmp_path))
+    updater = channel._app.updater
+    updater.running = True
+    updater.stop = AsyncMock()
+    updater.start_polling = AsyncMock()
+    channel._shutting_down = True
+
+    assert await channel._restart_polling(updater) is False
+
+    updater.stop.assert_not_awaited()
+    updater.start_polling.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_telegram_restart_polling_skips_replaced_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("token", _Bus(), _SessionManager(tmp_path))
+    updater = channel._app.updater
+    updater.running = True
+    updater.stop = AsyncMock()
+    updater.start_polling = AsyncMock()
+    observed_task = object()
+    setattr(updater, "_Updater__polling_task", object())
+
+    assert (
+        await channel._restart_polling(updater, expected_task=observed_task) is False
+    )
+
+    updater.stop.assert_not_awaited()
+    updater.start_polling.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_telegram_polling_activity_tracks_empty_get_updates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("token", _Bus(), _SessionManager(tmp_path))
+    channel._last_poll_activity_at = 0
+
+    await channel._polling_activity_request.do_request(
+        url="https://api.telegram.org/bot123/getUpdates",
+        method="POST",
+    )
+
+    assert channel._last_poll_activity_at > 0
+
+
+@pytest.mark.asyncio
+async def test_telegram_restart_recovers_when_stop_propagates_failed_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("token", _Bus(), _SessionManager(tmp_path))
+    updater = channel._app.updater
+    failed_task = SimpleNamespace(done=lambda: True)
+    stop_event = asyncio.Event()
+    stop_event.set()
+    cleanup = object()
+    setattr(updater, "_Updater__polling_task", failed_task)
+    setattr(updater, "_Updater__polling_task_stop_event", stop_event)
+    setattr(updater, "_Updater__polling_cleanup_cb", cleanup)
+    updater.running = True
+    start_calls = 0
+
+    async def _stop() -> None:
+        updater.running = False
+        raise OSError("polling crashed")
+
+    async def _start(**_kwargs) -> None:
+        nonlocal start_calls
+        start_calls += 1
+        updater.running = True
+
+    updater.stop = _stop
+    updater.start_polling = _start
+
+    assert await channel._restart_polling(updater, expected_task=failed_task) is True
+    assert start_calls == 1
+    assert updater.running is True
+    assert stop_event.is_set() is False
+    assert getattr(updater, "_Updater__polling_task") is None
+    assert getattr(updater, "_Updater__polling_cleanup_cb") is None
 
 
 @pytest.mark.asyncio

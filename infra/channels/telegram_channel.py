@@ -4,11 +4,11 @@ Telegram Channel
 将 Telegram Bot 接入 Core v3 Channel ingress，支持 allowFrom 白名单。
 """
 
-import logging
 import asyncio
 import html
 from io import BytesIO
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 from telegram import BotCommand, Update
 from telegram.constants import ChatAction
 from telegram.error import Conflict, NetworkError, TelegramError, TimedOut
@@ -26,6 +27,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import BaseRequest, HTTPXRequest
 
 from bus.event_bus import EventBus
 from bus.events import (
@@ -84,6 +86,52 @@ _LIVE_STREAM_MIN_CHARS = 200
 # 原生会持续退避重试 TelegramError（含 Conflict，上限 30s），callback 无需干预 polling，
 # 这里只做日志节流，避免持续冲突时刷屏。
 _CONFLICT_LOG_INTERVAL_SECONDS = 60
+# Polling watchdog: restart only when PTB's internal task has exited while the
+# updater still claims to be running.
+_POLLING_WATCH_INTERVAL_SECONDS = 15
+_POLLING_RESTART_BASE_DELAY = 2.0
+_POLLING_RESTART_MAX_DELAY = 60.0
+_POLLING_WATCH_TASK_NAME = "TelegramChannel:polling_watchdog"
+# Independent connectivity probe: observe route recovery without sharing PTB's
+# connection pool or exposing the bot token in a separate HTTP request URL.
+_PROBE_INTERVAL_SECONDS = 30
+_PROBE_TIMEOUT_SECONDS = 5
+_PROBE_FAIL_THRESHOLD = 3
+_STALL_THRESHOLD_SECONDS = 120
+_PROBE_URL = "https://api.telegram.org"
+_PROBE_TASK_NAME = "TelegramChannel:connectivity_probe"
+_POLLING_TASK_UNSET = object()
+_POLLING_TASK_UNAVAILABLE = object()
+
+
+@dataclass(frozen=True)
+class _ConnectivityProbeResult:
+    ok: bool
+    detail: str
+
+
+class _PollingActivityRequest(BaseRequest):
+    """Record successful getUpdates responses without patching the Bot object."""
+
+    def __init__(self, delegate: BaseRequest, on_poll_activity) -> None:
+        self._delegate = delegate
+        self._on_poll_activity = on_poll_activity
+
+    @property
+    def read_timeout(self) -> float | None:
+        return self._delegate.read_timeout
+
+    async def initialize(self) -> None:
+        await self._delegate.initialize()
+
+    async def shutdown(self) -> None:
+        await self._delegate.shutdown()
+
+    async def do_request(self, url: str, method: str, **kwargs: Any):
+        result = await self._delegate.do_request(url=url, method=method, **kwargs)
+        if url.endswith("/getUpdates"):
+            self._on_poll_activity()
+        return result
 
 
 def _normalize_v3_content(value: str) -> str:
@@ -225,7 +273,16 @@ class TelegramChannel:
             metadata_key="username",
             normalizer=lambda value: value.lower(),
         )
-        self._app = Application.builder().token(token).build()
+        self._polling_activity_request = _PollingActivityRequest(
+            HTTPXRequest(),
+            self._record_poll_activity,
+        )
+        self._app = (
+            Application.builder()
+            .token(token)
+            .get_updates_request(self._polling_activity_request)
+            .build()
+        )
         self._command_catalog_provider = command_catalog_provider
         self._app.add_handler(CommandHandler("stop", self._on_stop_command))
         self._app.add_handler(
@@ -257,6 +314,15 @@ class TelegramChannel:
         self._live_tasks: set[asyncio.Task[None]] = set()
         self._live_tasks_by_session: dict[str, set[asyncio.Task[None]]] = {}
         self._v3_inbound_runtime = _TelegramInboundRuntime()
+        self._polling_watch_task: asyncio.Task[None] | None = None
+        self._connectivity_probe_task: asyncio.Task[None] | None = None
+        self._polling_restart_lock = asyncio.Lock()
+        self._last_poll_activity_at = time.monotonic()
+        self._last_probe_ok: bool | None = None
+        self._probe_consecutive_fail = 0
+        self._last_probe_ok_at: float | None = None
+        self._probe_network_unavailable = False
+        self._shutting_down = False
 
     @property
     def bot(self):
@@ -308,9 +374,19 @@ class TelegramChannel:
         updater = self._app.updater
         if updater is None:
             raise RuntimeError("Telegram updater 未初始化")
+        self._shutting_down = False
+        self._record_poll_activity()
         await updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
             error_callback=self._on_polling_error,
+        )
+        self._polling_watch_task = asyncio.create_task(
+            self._watch_polling_loop(),
+            name=_POLLING_WATCH_TASK_NAME,
+        )
+        self._connectivity_probe_task = asyncio.create_task(
+            self._connectivity_probe_loop(),
+            name=_PROBE_TASK_NAME,
         )
         logger.info(f"TelegramChannel 已启动  已知用户: {len(self.user_map)}")
 
@@ -323,6 +399,21 @@ class TelegramChannel:
             self._events_bound = True
 
     async def stop(self) -> None:
+        self._shutting_down = True
+        background_tasks = [
+            task
+            for task in (
+                self._polling_watch_task,
+                self._connectivity_probe_task,
+            )
+            if task is not None
+        ]
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        self._polling_watch_task = None
+        self._connectivity_probe_task = None
         for session_key in tuple(self._live_tasks_by_session):
             await self._cancel_live_tasks(session_key)
         for session_key in tuple(self._live_messages):
@@ -381,9 +472,13 @@ class TelegramChannel:
         if username:
             await self._identity_index.remember(username, chat_id)
 
+    def _record_poll_activity(self) -> None:
+        self._last_poll_activity_at = time.monotonic()
+
     async def _on_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        self._record_poll_activity()
         msg = update.effective_message
         chat = update.effective_chat
         user = update.effective_user
@@ -642,6 +737,7 @@ class TelegramChannel:
     async def _on_stop_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        self._record_poll_activity()
         msg = update.effective_message
         chat = update.effective_chat
         user = update.effective_user
@@ -678,6 +774,7 @@ class TelegramChannel:
     async def _on_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        self._record_poll_activity()
         msg = update.effective_message
         chat = update.effective_chat
         user = update.effective_user
@@ -695,6 +792,7 @@ class TelegramChannel:
     async def _on_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        self._record_poll_activity()
         msg = update.effective_message
         chat = update.effective_chat
         user = update.effective_user
@@ -713,6 +811,7 @@ class TelegramChannel:
     async def _on_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        self._record_poll_activity()
         msg = update.effective_message
         chat = update.effective_chat
         user = update.effective_user
@@ -1039,10 +1138,11 @@ class TelegramChannel:
                 e,
             )
 
-    def _on_polling_error(self, exc: TelegramError) -> None:
+    def _on_polling_error(self, exc: Exception) -> None:
         """处理 Telegram polling 异常；409 Conflict 由 PTB 原生 network retry loop
         （max_retries=-1）持续退避重试（上限 30s），这里只做节流日志与状态观测，
         绝不干预 polling 生命周期。"""
+        self._record_poll_activity()
         if isinstance(exc, Conflict):
             self._conflict_count += 1
             now = time.monotonic()
@@ -1059,6 +1159,229 @@ class TelegramChannel:
                 )
             return
         logger.warning("[telegram] polling 异常，框架将自动重试: %s", exc)
+
+    async def _connectivity_probe_loop(self) -> None:
+        """Probe Telegram independently and act only on a failed-to-ok transition."""
+
+        updater = self._app.updater
+        if updater is None:
+            return
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(_PROBE_INTERVAL_SECONDS)
+                if self._shutting_down or not updater.running:
+                    return
+                result = await self._probe_telegram_connectivity()
+                await self._apply_connectivity_probe_result(updater, result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.error(
+                    "[telegram] 外部探活任务异常: %s",
+                    type(error).__name__,
+                )
+
+    async def _probe_telegram_connectivity(self) -> _ConnectivityProbeResult:
+        try:
+            async with httpx.AsyncClient(
+                timeout=_PROBE_TIMEOUT_SECONDS,
+                trust_env=True,
+                follow_redirects=False,
+            ) as client:
+                response = await client.get(_PROBE_URL)
+        except httpx.HTTPError as error:
+            return _ConnectivityProbeResult(False, type(error).__name__)
+        if response.status_code >= 500:
+            return _ConnectivityProbeResult(False, f"HTTP {response.status_code}")
+        return _ConnectivityProbeResult(True, f"HTTP {response.status_code}")
+
+    async def _apply_connectivity_probe_result(
+        self,
+        updater,
+        result: _ConnectivityProbeResult,
+    ) -> bool:
+        if not result.ok:
+            self._last_probe_ok = False
+            self._probe_consecutive_fail += 1
+            entered_unavailable = (
+                self._probe_consecutive_fail >= _PROBE_FAIL_THRESHOLD
+                and not self._probe_network_unavailable
+            )
+            if self._probe_consecutive_fail >= _PROBE_FAIL_THRESHOLD:
+                self._probe_network_unavailable = True
+            log = logger.warning if entered_unavailable else logger.info
+            log(
+                "[telegram] 外部探活失败（连续 %d 次）: %s",
+                self._probe_consecutive_fail,
+                result.detail,
+            )
+            return False
+
+        recovered = self._probe_network_unavailable
+        self._last_probe_ok = True
+        self._probe_consecutive_fail = 0
+        self._last_probe_ok_at = time.monotonic()
+        self._probe_network_unavailable = False
+        if not recovered:
+            return False
+        logger.info("[telegram] 外部探活恢复")
+        return await self._recover_stalled_polling(updater)
+
+    async def _recover_stalled_polling(self, updater) -> bool:
+        if self._shutting_down or not updater.running:
+            return False
+        polling_task = self._get_polling_task(updater)
+        if polling_task is _POLLING_TASK_UNAVAILABLE:
+            logger.warning("[telegram] PTB polling task 状态不可用，跳过探活重启")
+            return False
+        if polling_task is None or polling_task.done():
+            logger.info(
+                "[telegram] 外部探活恢复，polling task 已结束，交由轮询守护处理"
+            )
+            return False
+        stalled_for = time.monotonic() - self._last_poll_activity_at
+        if stalled_for < _STALL_THRESHOLD_SECONDS:
+            logger.info(
+                "[telegram] 外部探活恢复，polling 最近活动距今 %.1fs，跳过重启",
+                stalled_for,
+            )
+            return False
+        logger.warning(
+            "[telegram] polling task 存活但持续无网络活动 %.1fs，判定假死",
+            stalled_for,
+        )
+        restarted = await self._restart_polling(
+            updater,
+            expected_task=polling_task,
+        )
+        if restarted:
+            logger.warning("[telegram] 外部探活恢复，重启 polling")
+        return restarted
+
+    async def _watch_polling_loop(self) -> None:
+        """Restart PTB polling when its private task exits unexpectedly."""
+
+        updater = self._app.updater
+        if updater is None:
+            return
+        failures = 0
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(_POLLING_WATCH_INTERVAL_SECONDS)
+                if self._shutting_down or not updater.running:
+                    return
+                polling_task = self._get_polling_task(updater)
+                if polling_task is _POLLING_TASK_UNAVAILABLE:
+                    logger.warning("[telegram] PTB polling task 状态不可用，守护任务降级")
+                    await asyncio.sleep(_POLLING_WATCH_INTERVAL_SECONDS)
+                    continue
+                if polling_task is not None and not polling_task.done():
+                    failures = 0
+                    continue
+
+                failure: BaseException | None = None
+                reason = "polling task 缺失"
+                if polling_task is not None:
+                    try:
+                        failure = polling_task.exception()
+                        reason = (
+                            "polling task 提前结束（无异常）"
+                            if failure is None
+                            else str(failure) or type(failure).__name__
+                        )
+                    except asyncio.CancelledError:
+                        reason = "polling task 意外取消"
+
+                failures += 1
+                delay = min(
+                    _POLLING_RESTART_BASE_DELAY * (2 ** (failures - 1)),
+                    _POLLING_RESTART_MAX_DELAY,
+                )
+                logger.error(
+                    "[telegram] %s（第 %d 次），%.1fs 后自动重启",
+                    reason,
+                    failures,
+                    delay,
+                    exc_info=(
+                        None
+                        if failure is None
+                        else (type(failure), failure, failure.__traceback__)
+                    ),
+                )
+                await asyncio.sleep(delay)
+                if self._shutting_down or not updater.running:
+                    return
+                if await self._restart_polling(
+                    updater,
+                    expected_task=polling_task,
+                ):
+                    failures = 0
+                    logger.info("[telegram] polling 守护已自动重启轮询")
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.error(
+                    "[telegram] 轮询守护自身异常: %s",
+                    type(error).__name__,
+                )
+
+    async def _restart_polling(
+        self,
+        updater,
+        *,
+        expected_task: object = _POLLING_TASK_UNSET,
+    ) -> bool:
+        """Serialize PTB updater reset and preserve normal shutdown ownership."""
+
+        async with self._polling_restart_lock:
+            if self._shutting_down or not updater.running:
+                return False
+            if (
+                expected_task is not _POLLING_TASK_UNSET
+                and self._get_polling_task(updater)
+                is not expected_task
+            ):
+                return False
+            try:
+                await updater.stop()
+            except RuntimeError as error:
+                logger.warning(
+                    "[telegram] 轮询重启前 updater.stop() 未处于运行态: %s",
+                    error,
+                )
+            except Exception as error:
+                logger.warning(
+                    "[telegram] polling task 已失败，updater.stop() 传播原异常，继续复位: %s",
+                    type(error).__name__,
+                )
+                self._reset_failed_polling_state(updater)
+            if self._shutting_down:
+                return False
+            await updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                error_callback=self._on_polling_error,
+            )
+            self._record_poll_activity()
+            return True
+
+    @staticmethod
+    def _get_polling_task(updater: Any) -> object:
+        return getattr(updater, "_Updater__polling_task", _POLLING_TASK_UNAVAILABLE)
+
+    @classmethod
+    def _reset_failed_polling_state(cls, updater: Any) -> None:
+        """Clear PTB 22.x state left behind when stop awaits a failed task."""
+
+        polling_task = cls._get_polling_task(updater)
+        if polling_task is _POLLING_TASK_UNAVAILABLE:
+            return
+        if polling_task is not None and not polling_task.done():
+            return
+        stop_event = getattr(updater, "_Updater__polling_task_stop_event", None)
+        if stop_event is not None:
+            stop_event.clear()
+        setattr(updater, "_Updater__polling_task", None)
+        setattr(updater, "_Updater__polling_cleanup_cb", None)
 
 
 class TelegramV3ChannelAdapter(NativeChannelDeliveryAdapter):
